@@ -8,7 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention, _score_mod_signature
+from torch.nn.attention.flex_attention import flex_attention
 
 from typing import Optional, Tuple, Type
 
@@ -234,9 +234,6 @@ class Attention(nn.Module):
         rel_h, rel_w = None, None
         if self.use_rel_pos:
             rel_h, rel_w = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
-            # rel_h.shape: (B*nHead, q_h * q_w, k_h, 1) = (B*nHead, H * W, H, 1)
-            # rel_w.shape: (B*nHead, q_h * q_w, 1, k_w) = (B*nHead, H * W, 1, W)
-            # attn_bias.shape: (B, num_heads, H * W, H * W)
 
         q = q.view(B, self.num_heads, H * W, -1)
         k = k.view(B, self.num_heads, H * W, -1)
@@ -287,9 +284,6 @@ class Attention(nn.Module):
             q = torch.nn.functional.pad(q, (0, 128 - 80), "constant", 0)
             k = torch.nn.functional.pad(k, (0, 128 - 80), "constant", 0)
             v = torch.nn.functional.pad(v, (0, 128 - 80), "constant", 0)
-
-        # print(f"rel_h.shape: {rel_h.shape}")  # 800, 16, 196, 14
-        # print(f"rel_w.shape: {rel_w.shape}")  # 800, 16, 196, 14
 
         # I'm not sure why, but setting the position biases as class attributes
         # is necessary to avoid a Torch Inductor error ("LoweringException:
@@ -383,7 +377,7 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
     k_coords = torch.arange(k_size, device=rel_pos.device)[None, :] * max(q_size / k_size, 1.0)
     relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
 
-    return rel_pos_resized[relative_coords.long()]  # (q_size, k_size, C)
+    return rel_pos_resized[relative_coords.long()]
 
 
 def add_decomposed_rel_pos(
@@ -408,8 +402,8 @@ def add_decomposed_rel_pos(
     """
     q_h, q_w = q_size
     k_h, k_w = k_size
-    Rh = get_rel_pos(q_h, k_h, rel_pos_h)  # (H, H, C)
-    Rw = get_rel_pos(q_w, k_w, rel_pos_w)  # (W, W, C)
+    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
+    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
@@ -417,8 +411,8 @@ def add_decomposed_rel_pos(
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
     rel_h = rel_h.unsqueeze(-1)
     rel_w = rel_w.unsqueeze(-2)
-    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1)  # (B*nhead, q_h*q_w, k_h, 1)
-    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w)  # (B*nhead, q_h*q_w, 1, k_w)
+    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1)
+    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w)
 
     return rel_h, rel_w
 
