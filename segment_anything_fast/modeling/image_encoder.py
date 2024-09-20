@@ -4,15 +4,17 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, _score_mod_signature
 
 from typing import Optional, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
 
-from segment_anything_fast.flash_4 import _attention_rel_h_rel_w
+# from segment_anything_fast.flash_4 import _attention_rel_h_rel_w
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class ImageEncoderViT(nn.Module):
@@ -232,6 +234,9 @@ class Attention(nn.Module):
         rel_h, rel_w = None, None
         if self.use_rel_pos:
             rel_h, rel_w = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            # rel_h.shape: (B*nHead, q_h * q_w, k_h, 1) = (B*nHead, H * W, H, 1)
+            # rel_w.shape: (B*nHead, q_h * q_w, 1, k_w) = (B*nHead, H * W, 1, W)
+            # attn_bias.shape: (B, num_heads, H * W, H * W)
 
         q = q.view(B, self.num_heads, H * W, -1)
         k = k.view(B, self.num_heads, H * W, -1)
@@ -242,7 +247,9 @@ class Attention(nn.Module):
             rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
             # attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
             # x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
-            x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+            # x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+
+            x = self.flex_attention_fwd(q, k, v, rel_h.squeeze(-1), rel_w.squeeze(-2))
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
@@ -251,6 +258,50 @@ class Attention(nn.Module):
         x = self.proj(x)
 
         return x
+
+    def flex_attention_fwd(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_h: torch.Tensor, rel_w: torch.Tensor) -> torch.Tensor:
+        """Flex attention forward pass with relative position biases.
+
+        Args:
+            q (Tensor): Query tensor, shape (B, num_heads, H*W, C).
+            k (Tensor): Key tensor, shape   (B, num_heads, H*W, C).
+            v (Tensor): Value tensor, shape (B, num_heads, H*W, C).
+            rel_h (Tensor): Relative position biases for the height dimension, shape (B, num_heads, H*W, H).
+            rel_w (Tensor): Relative position biases for the width dimension, shape (B, num_heads, H*W, W).
+        """
+
+        def score_mod(score, batch, head, q_idx, k_idx):
+            """Add relative position bias to the attention score."""
+            w = rel_w.size(-1)
+            h_idx = k_idx // w
+            w_idx = k_idx % w
+            attn_bias = self.rel_h[batch, head, q_idx, h_idx] + self.rel_w[batch, head, q_idx, w_idx]
+            return score + attn_bias
+
+        is_vit_h = q.size(-1) == 80
+
+        sm_scale = None
+        if is_vit_h:
+            # Flex Attention only supports powers of 2 for embedding dimension, so need to pad
+            sm_scale = 1. / math.sqrt(q.size(-1))
+            q = torch.nn.functional.pad(q, (0, 128 - 80), "constant", 0)
+            k = torch.nn.functional.pad(k, (0, 128 - 80), "constant", 0)
+            v = torch.nn.functional.pad(v, (0, 128 - 80), "constant", 0)
+
+        # print(f"rel_h.shape: {rel_h.shape}")  # 800, 16, 196, 14
+        # print(f"rel_w.shape: {rel_w.shape}")  # 800, 16, 196, 14
+
+        # I'm not sure why, but setting the position biases as class attributes
+        # is necessary to avoid a Torch Inductor error ("LoweringException:
+        # AttributeError: 'View' object has no attribute 'get_stride'")
+        self.rel_h = rel_h
+        self.rel_w = rel_w
+
+        o = flex_attention(q, k, v, score_mod=score_mod, scale=sm_scale)
+
+        if is_vit_h:
+            return o[:, :, :, :80]
+        return o
 
 
 def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
@@ -332,7 +383,7 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
     k_coords = torch.arange(k_size, device=rel_pos.device)[None, :] * max(q_size / k_size, 1.0)
     relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
 
-    return rel_pos_resized[relative_coords.long()]
+    return rel_pos_resized[relative_coords.long()]  # (q_size, k_size, C)
 
 
 def add_decomposed_rel_pos(
@@ -357,8 +408,8 @@ def add_decomposed_rel_pos(
     """
     q_h, q_w = q_size
     k_h, k_w = k_size
-    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
-    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+    Rh = get_rel_pos(q_h, k_h, rel_pos_h)  # (H, H, C)
+    Rw = get_rel_pos(q_w, k_w, rel_pos_w)  # (W, W, C)
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
@@ -366,8 +417,8 @@ def add_decomposed_rel_pos(
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
     rel_h = rel_h.unsqueeze(-1)
     rel_w = rel_w.unsqueeze(-2)
-    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1)
-    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w)
+    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1)  # (B*nhead, q_h*q_w, k_h, 1)
+    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w)  # (B*nhead, q_h*q_w, 1, k_w)
 
     return rel_h, rel_w
 
