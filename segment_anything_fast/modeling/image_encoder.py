@@ -244,9 +244,19 @@ class Attention(nn.Module):
             rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
             # attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
             # x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
-            # x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
 
-            x = self.flex_attention_fwd(q, k, v, rel_h.squeeze(-1), rel_w.squeeze(-2))
+            # Trace the attention function
+            if 0:
+                from segment_anything_fast.flash_4 import _attention_rel_h_rel_w
+                torch.cuda.synchronize()
+                with torch.autograd.profiler.record_function("_attention_rel_h_rel_w"):
+                    x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+                torch.cuda.synchronize()
+            else:
+                torch.cuda.synchronize()
+                with torch.autograd.profiler.record_function("flex_attention_fwd"):
+                    x = self.flex_attention_fwd(q, k, v, rel_h.squeeze(-1), rel_w.squeeze(-2))
+                torch.cuda.synchronize()
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
